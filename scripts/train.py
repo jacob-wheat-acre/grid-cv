@@ -22,10 +22,32 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
+# Device auto-detection
+# ---------------------------------------------------------------------------
+
+def _best_device() -> str:
+    """
+    Return the best available compute device string for Ultralytics:
+      'mps'  – Apple Silicon (M1/M2/M3/M4) via Metal Performance Shaders
+      '0'    – first CUDA GPU
+      'cpu'  – fallback
+    """
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "0"
+    except ImportError:
+        pass
+    return "cpu"
+
+
+# ---------------------------------------------------------------------------
 # Shared training configuration
 # ---------------------------------------------------------------------------
 
-DETECTOR_BASE_MODEL  = "yolov8m.pt"      # medium: good balance for aerial
+DETECTOR_BASE_MODEL   = "yolov8m.pt"      # medium: good balance for aerial
 CLASSIFIER_BASE_MODEL = "yolov8m-cls.pt"
 
 DETECTOR_HYPERPARAMS = {
@@ -58,7 +80,7 @@ def train_detector(
     epochs: int = 100,
     imgsz: int = 640,
     batch: int = 16,
-    device: str = "0",
+    device: str | None = None,
     output_dir: Path = Path("runs/detect"),
     resume: bool = False,
     workers: int = 8,
@@ -69,6 +91,8 @@ def train_detector(
         print("ultralytics not installed: pip install ultralytics", file=sys.stderr)
         sys.exit(1)
 
+    resolved_device = device or _best_device()
+    print(f"Device: {resolved_device}")
     model = YOLO(DETECTOR_BASE_MODEL)
     print(f"Training detector on {data_yaml}")
     model.train(
@@ -76,7 +100,7 @@ def train_detector(
         epochs=epochs,
         imgsz=imgsz,
         batch=batch,
-        device=device,
+        device=resolved_device,
         project=str(output_dir),
         name="grid_cv_detector",
         exist_ok=True,
@@ -112,7 +136,7 @@ def train_classifier(
     epochs: int = 50,
     imgsz: int = 224,
     batch: int = 32,
-    device: str = "0",
+    device: str | None = None,
     output_dir: Path = Path("runs/classify"),
     resume: bool = False,
 ) -> None:
@@ -129,6 +153,8 @@ def train_classifier(
         print("ultralytics not installed: pip install ultralytics", file=sys.stderr)
         sys.exit(1)
 
+    resolved_device = device or _best_device()
+    print(f"Device: {resolved_device}")
     model = YOLO(CLASSIFIER_BASE_MODEL)
     print(f"Training classifier on {data_dir}")
     model.train(
@@ -136,7 +162,7 @@ def train_classifier(
         epochs=epochs,
         imgsz=imgsz,
         batch=batch,
-        device=device,
+        device=resolved_device,
         project=str(output_dir),
         name="grid_cv_classifier",
         exist_ok=True,
