@@ -10,7 +10,7 @@ Two-stage pipeline: SAHI + YOLOv8 localization → defect classifier.
 ```
 grid_cv/        – importable package (config, telemetry, pipeline, geo, api, cli)
 scripts/        – training & dataset prep (not part of the package)
-tests/          – pytest suite (48 tests, all must pass)
+tests/          – pytest suite (67 tests, all must pass)
 models/         – place detector.pt / classifier.pt here (gitignored)
 sample_images/  – test drone images (gitignored)
 results/        – CLI output (gitignored)
@@ -31,14 +31,19 @@ python -m grid_cv inspect sample_images/ --output results/
 # Start API server
 python -m grid_cv serve --reload
 
-# Prepare dataset
-python scripts/prepare_dataset.py --source ./raw_data/insplad --output ./datasets/grid_cv
+# Download training data (free, no keys; add --limit 10 for a smoke test)
+python -m pip install -e ".[data]"
+python scripts/download_insplad.py      # Hugging Face, CC BY-NC 3.0
+python scripts/download_mpid.py         # Google Drive, insulator boxes only
+
+# Assemble a license-filtered build (add --commercial-only for production)
+python scripts/build_training_set.py --name poc
 
 # Train Stage 1 detector
-python scripts/train.py detector --data datasets/grid_cv/dataset.yaml --epochs 100
+python scripts/train.py detector --data datasets/build/poc/detector.yaml --epochs 100
 
 # Train Stage 2 classifier
-python scripts/train.py classifier --data datasets/defects --epochs 50
+python scripts/train.py classifier --data datasets/build/poc/classifier --epochs 50
 ```
 
 ## Architecture Decisions
@@ -72,6 +77,15 @@ computed on `InspectionResult` from all detections in that image.
 Detections without GPS coordinates emit `"geometry": null`.
 This is valid per RFC 7946 and loads in QGIS/ArcGIS.
 
+### Training-data licensing
+Every downloaded image gets a row in `datasets/<source>/provenance.csv`
+(source, license, `commercial_ok`).  Sources and their license status live
+in `scripts/data_sources.py`.  InsPLAD and MPID are **not** cleared for
+commercial use and are proof-of-concept only.  A production model must be
+trained from base weights on a `build_training_set.py --commercial-only`
+build, never fine-tuned from a POC checkpoint.  Ultralytics YOLOv8 is
+AGPL-3.0, which is free to use but needs legal review before any closed-source deployment.
+
 ## Key Files & What They Own
 
 | File | Responsibility |
@@ -91,7 +105,7 @@ data required.  Fixtures in `conftest.py` create:
 - `synthetic_thermal_path` — 640×512 pseudo-thermal PNG
 - `synthetic_hires_path` — 4096×3072 JPEG for SAHI/slicing tests
 
-**All 48 tests must pass before any PR.**
+**All 67 tests must pass before any PR.**
 
 ```bash
 pytest -v          # verbose

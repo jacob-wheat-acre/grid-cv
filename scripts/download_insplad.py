@@ -1,309 +1,242 @@
 """
-download_insplad.py – Download and reformat InsPLAD for grid-cv training.
+download_insplad.py – Download InsPLAD from Hugging Face and convert it for grid-cv.
 
-InsPLAD (Inspection of Power Lines and Assets Dataset)
-  Paper : https://arxiv.org/abs/2311.01979
-  Source: https://universe.roboflow.com/insplad
+InsPLAD (Inspection of Power Line Assets Dataset)
+  Paper  : https://arxiv.org/abs/2311.01619
+  Source : https://huggingface.co/datasets/Voxel51/InsPLAD  (no account or key needed)
+  License: CC BY-NC 3.0, non-commercial only.  Every converted image is
+           recorded in datasets/insplad/provenance.csv so it can be excluded
+           later with `build_training_set.py --commercial-only`.
 
-Two sub-datasets are downloaded:
-  insplad-det   -> Stage 1 detector training  (asset localisation)
-  insplad-fault -> Stage 2 classifier training (defect classification)
+Output
+------
+  datasets/insplad/detector/images/{train,val}/*.jpg   YOLO detection (Stage 1)
+  datasets/insplad/detector/labels/{train,val}/*.txt
+  datasets/insplad/classifier/{train,val}/<defect>/    ImageFolder (Stage 2)
+  datasets/insplad/provenance.csv
+  datasets/_raw/insplad_hf/                            downloaded originals
 
-Both are remapped to grid-cv class names via config.INSPLAD_DET_MAP and
-config.INSPLAD_FAULT_MAP before writing the final dataset.yaml files.
+Converted images are hard links to the downloaded originals, so they take
+no extra disk space.  Downloads resume: re-running skips files you already have.
 
 Usage
 -----
-  # First time: get a free API key at https://app.roboflow.com/ -> Settings
-  python scripts/download_insplad.py --api-key YOUR_KEY --output datasets/
+  python scripts/download_insplad.py                    # everything (~5-6 GB)
+  python scripts/download_insplad.py --limit 50         # quick smoke test
+  python scripts/download_insplad.py --skip-fault       # detector data only
 
-  # Skip a sub-dataset you already have
-  python scripts/download_insplad.py --api-key YOUR_KEY --output datasets/ --skip-fault
+Set HF_TOKEN (free Hugging Face account) if you hit rate limits (HTTP 429).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from data_sources import (  # noqa: E402
+    PROVENANCE_FILENAME,
+    link_or_copy,
+    provenance_row,
+    read_provenance,
+    safe_name,
+    source,
+    write_provenance,
+)
+
+HF_REPO = "Voxel51/InsPLAD"
+# Pinned so the dataset can't change underneath a training run.
+HF_REVISION = "a68d69d8afaebe32afd2707c88e6d71114986f44"
+
+_FILEPATH_RE = re.compile(r"^data/data_\d+/[^/\\]+\.(jpg|jpeg|png)$", re.IGNORECASE)
+
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Pure conversion helpers (unit-tested)
 # ---------------------------------------------------------------------------
 
-def _require(pkg: str, install: str) -> None:
-    try:
-        __import__(pkg)
-    except ImportError:
-        print(f"Required package '{pkg}' not found. Install with:\n  pip install {install}")
-        sys.exit(1)
+def fo_bbox_to_yolo(bbox: list[float]) -> tuple[float, float, float, float] | None:
+    """FiftyOne [x, y, w, h] (top-left, relative) -> YOLO (cx, cy, w, h), clamped."""
+    x, y, w, h = (float(v) for v in bbox)
+    x1, y1 = max(0.0, x), max(0.0, y)
+    x2, y2 = min(1.0, x + w), min(1.0, y + h)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return ((x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1)
 
 
-def _remap_yolo_labels(
-    label_dir: Path,
-    old_names: list[str],
-    new_names: list[str],
-    name_map: dict[str, str],
-) -> int:
-    """
-    Rewrite every .txt label file in *label_dir*, remapping class indices
-    from *old_names* -> *new_names* via *name_map*.
-
-    Returns the number of files modified.
-    """
-    # Build old_index -> new_index lookup
-    index_map: dict[int, int] = {}
-    for old_idx, old_name in enumerate(old_names):
-        new_name = name_map.get(old_name, old_name)
-        if new_name in new_names:
-            index_map[old_idx] = new_names.index(new_name)
-        # else: label is dropped (class not in our taxonomy)
-
-    modified = 0
-    for lbl_file in label_dir.rglob("*.txt"):
-        lines = lbl_file.read_text().strip().splitlines()
-        new_lines = []
-        for line in lines:
-            parts = line.split()
-            if not parts:
-                continue
-            old_idx = int(parts[0])
-            if old_idx in index_map:
-                parts[0] = str(index_map[old_idx])
-                new_lines.append(" ".join(parts))
-            # else: drop this annotation (unmapped class)
-        lbl_file.write_text("\n".join(new_lines))
-        modified += 1
-    return modified
+def detections_to_yolo_lines(
+    detections: list[dict],
+    det_map: dict[str, str],
+    component_classes: list[str],
+) -> list[str]:
+    lines = []
+    for d in detections:
+        target = det_map.get(d.get("label", ""))
+        if target is None:
+            continue
+        box = fo_bbox_to_yolo(d["bounding_box"])
+        if box is None:
+            continue
+        idx = component_classes.index(target)
+        lines.append(f"{idx} " + " ".join(f"{v:.6f}" for v in box))
+    return lines
 
 
-def _write_dataset_yaml(
-    root: Path,
-    names: list[str],
-    filename: str = "dataset.yaml",
-) -> Path:
-    content = (
-        f"path: {root.resolve()}\n"
-        f"train: images/train\n"
-        f"val:   images/val\n"
-        f"test:  images/test\n\n"
-        f"nc: {len(names)}\n"
-        f"names: {names}\n"
-    )
-    out = root / filename
-    out.write_text(content)
+def sample_split(sample: dict) -> str:
+    tags = sample.get("tags", [])
+    return "val" if "val" in tags else "train"
+
+
+def _limit_per_group(samples: list[dict], n: int) -> list[dict]:
+    """Keep up to *n* samples per (split, fault label) so smoke runs cover every class."""
+    seen: dict[tuple[str, str], int] = {}
+    out = []
+    for s in samples:
+        key = (sample_split(s), (s.get("fault") or {}).get("label", ""))
+        if seen.get(key, 0) < n:
+            seen[key] = seen.get(key, 0) + 1
+            out.append(s)
     return out
 
 
-# ---------------------------------------------------------------------------
-# Download helpers
-# ---------------------------------------------------------------------------
-
-_ROBOFLOW_HINT = """
-Roboflow workspace not found.  The InsPLAD dataset slug may have changed.
-To get the correct download snippet:
-
-  1. Go to https://universe.roboflow.com and search "InsPLAD"
-  2. Open the dataset -> click "Download Dataset" -> choose "YOLOv8" format
-  3. Select "Show download code" -> copy the Python snippet
-  4. The snippet will look like:
-       rf.workspace("WORKSPACE").project("PROJECT").version(N).download("yolov8")
-  5. Re-run with the correct values:
-       python scripts/download_insplad.py \\
-           --api-key YOUR_KEY \\
-           --det-workspace WORKSPACE --det-project PROJECT --det-version N \\
-           --fault-workspace WORKSPACE2 --fault-project PROJECT2 --fault-version N2 \\
-           --output datasets/
-"""
-
-
-def _download_roboflow(
-    api_key: str,
-    workspace: str,
-    project: str,
-    version: int,
-    output_dir: Path,
-    fmt: str = "yolov8",
-) -> Path:
-    from roboflow import Roboflow  # type: ignore
-    try:
-        rf = Roboflow(api_key=api_key)
-        proj = rf.workspace(workspace).project(project)
-        dataset = proj.version(version).download(fmt, location=str(output_dir), overwrite=False)
-        return Path(dataset.location)
-    except Exception as exc:
-        if "does not exist" in str(exc) or "404" in str(exc) or "permissions" in str(exc):
-            print(_ROBOFLOW_HINT)
-        raise
+def output_name(filepath: str) -> str:
+    """data/data_7/foo bar.jpg -> data_7_foo_bar.jpg (unique and space-free)."""
+    _, folder, name = filepath.split("/")
+    return safe_name(f"{folder}_{name}")
 
 
 # ---------------------------------------------------------------------------
-# Stage 1 – detector dataset
+# Download
 # ---------------------------------------------------------------------------
 
-def download_detector_dataset(
-    api_key: str,
-    output_root: Path,
-    workspace: str = "insplad",
-    project: str = "insplad-det",
-    version: int = 1,
-) -> Path:
-    """Download insplad-det and remap to grid-cv component classes."""
+def _hf_download(filename: str, raw_dir: Path, retries: int = 6) -> Path:
+    from huggingface_hub import hf_hub_download
+
+    local = raw_dir / filename
+    if local.exists() and local.stat().st_size > 0:
+        return local
+    delay = 2.0
+    for attempt in range(retries):
+        try:
+            return Path(hf_hub_download(
+                HF_REPO, filename, repo_type="dataset",
+                revision=HF_REVISION, local_dir=raw_dir,
+            ))
+        except Exception as exc:  # network errors, 429s
+            if attempt == retries - 1:
+                raise
+            msg = str(exc)
+            wait = delay * (4 if "429" in msg else 1)
+            time.sleep(wait)
+            delay *= 2
+    raise RuntimeError("unreachable")
+
+
+def load_samples(raw_dir: Path) -> list[dict]:
+    path = _hf_download("samples.json", raw_dir)
+    with path.open() as f:
+        samples = json.load(f)["samples"]
+    good = [s for s in samples if _FILEPATH_RE.match(s.get("filepath", ""))]
+    if len(good) != len(samples):
+        print(f"  Skipped {len(samples) - len(good)} samples with unexpected paths")
+    return good
+
+
+def download_images(filepaths: list[str], raw_dir: Path, workers: int) -> list[str]:
+    """Download images concurrently. Returns the filepaths that failed."""
+    from tqdm import tqdm
+
+    failed: list[str] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_hf_download, fp, raw_dir): fp for fp in filepaths}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="  images"):
+            try:
+                fut.result()
+            except Exception as exc:
+                failed.append(futures[fut])
+                tqdm.write(f"  FAILED {futures[fut]}: {exc}")
+    return failed
+
+
+# ---------------------------------------------------------------------------
+# Convert
+# ---------------------------------------------------------------------------
+
+def convert_detector(
+    samples: list[dict], raw_dir: Path, datasets_root: Path
+) -> list[dict[str, str]]:
     from grid_cv.config import COMPONENT_CLASSES, INSPLAD_DET_MAP
 
-    out = output_root / "insplad_det_raw"
-    print(f"Downloading {workspace}/{project} v{version} (asset detection)...")
-    dataset_path = _download_roboflow(
-        api_key=api_key,
-        workspace=workspace,
-        project=project,
-        version=version,
-        output_dir=out,
-    )
-
-    # Read the original class names from the downloaded dataset.yaml
-    import yaml  # type: ignore
-    yaml_path = dataset_path / "data.yaml"
-    if not yaml_path.exists():
-        yaml_path = dataset_path / "dataset.yaml"
-    with yaml_path.open() as f:
-        meta = yaml.safe_load(f)
-    original_names: list[str] = meta.get("names", [])
-    print(f"  Original classes ({len(original_names)}): {original_names}")
-
-    # Remap labels
-    for split in ("train", "valid", "test"):
-        lbl_dir = dataset_path / split / "labels"
-        if lbl_dir.exists():
-            n = _remap_yolo_labels(lbl_dir, original_names, COMPONENT_CLASSES, INSPLAD_DET_MAP)
-            print(f"  Remapped {n} label files in {split}/")
-
-    # Write final dataset.yaml
-    final_dir = output_root / "detector"
-    if final_dir.exists():
-        shutil.rmtree(final_dir)
-    shutil.copytree(dataset_path, final_dir)
-    yaml_out = _write_dataset_yaml(final_dir, COMPONENT_CLASSES)
-    print(f"  Detector dataset ready -> {final_dir}")
-    print(f"  dataset.yaml           -> {yaml_out}")
-    return final_dir
+    src = source("insplad")
+    out = datasets_root / "insplad" / "detector"
+    if out.exists():
+        shutil.rmtree(out)
+    rows = []
+    for s in samples:
+        raw = raw_dir / s["filepath"]
+        if not raw.exists():
+            continue
+        split = sample_split(s)
+        name = output_name(s["filepath"])
+        img_dst = out / "images" / split / name
+        lbl_dst = out / "labels" / split / (Path(name).stem + ".txt")
+        link_or_copy(raw, img_dst)
+        dets = (s.get("ground_truth") or {}).get("detections", [])
+        lines = detections_to_yolo_lines(dets, INSPLAD_DET_MAP, COMPONENT_CLASSES)
+        lbl_dst.parent.mkdir(parents=True, exist_ok=True)
+        lbl_dst.write_text("\n".join(lines) + ("\n" if lines else ""))
+        rows.append(provenance_row(
+            datasets_root=datasets_root, image_path=img_dst, src=src,
+            task="detector", split=split, origin=s["filepath"],
+        ))
+    return rows
 
 
-# ---------------------------------------------------------------------------
-# Stage 2 – classifier dataset
-# ---------------------------------------------------------------------------
-
-def download_fault_dataset(
-    api_key: str,
-    output_root: Path,
-    workspace: str = "insplad",
-    project: str = "insplad-fault",
-    version: int = 1,
-) -> Path:
-    """
-    Download insplad-fault and convert to an ImageFolder layout for the
-    YOLOv8 classifier (one subdirectory per class).
-
-    InsPLAD-fault is a detection dataset — we convert each detected crop
-    into a classification example by:
-      1. Reading each label file
-      2. Cropping the image at each bbox
-      3. Saving the crop into  <class_name>/<image_stem>_<idx>.jpg
-    """
-    import cv2
-    import numpy as np
+def convert_classifier(
+    samples: list[dict], raw_dir: Path, datasets_root: Path
+) -> list[dict[str, str]]:
     from grid_cv.config import DEFECT_CLASSES, INSPLAD_FAULT_MAP
 
-    out = output_root / "insplad_fault_raw"
-    print(f"\nDownloading {workspace}/{project} v{version} (fault detection)...")
-    dataset_path = _download_roboflow(
-        api_key=api_key,
-        workspace=workspace,
-        project=project,
-        version=version,
-        output_dir=out,
-    )
-
-    import yaml  # type: ignore
-    yaml_path = dataset_path / "data.yaml"
-    if not yaml_path.exists():
-        yaml_path = dataset_path / "dataset.yaml"
-    with yaml_path.open() as f:
-        meta = yaml.safe_load(f)
-    original_names: list[str] = meta.get("names", [])
-    print(f"  Original fault classes ({len(original_names)}): {original_names}")
-
-    # Build output ImageFolder structure
-    clf_root = output_root / "classifier"
-    clf_root.mkdir(parents=True, exist_ok=True)
-
-    crop_count = 0
-    padding = 0.15  # match BBOX_PADDING_RATIO from config
-
-    for split in ("train", "valid", "test"):
-        img_dir = dataset_path / split / "images"
-        lbl_dir = dataset_path / split / "labels"
-        if not img_dir.exists():
+    src = source("insplad")
+    out = datasets_root / "insplad" / "classifier"
+    if out.exists():
+        shutil.rmtree(out)
+    rows = []
+    for s in samples:
+        raw = raw_dir / s["filepath"]
+        if not raw.exists():
             continue
-
-        split_out = clf_root / ("val" if split == "valid" else split)
-        split_out.mkdir(exist_ok=True)
-
-        for img_path in sorted(img_dir.glob("*")):
-            if img_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
-                continue
-            lbl_path = lbl_dir / img_path.with_suffix(".txt").name
-            if not lbl_path.exists():
-                continue
-
-            img = cv2.imread(str(img_path))
-            if img is None:
-                continue
-            h, w = img.shape[:2]
-
-            for idx, line in enumerate(lbl_path.read_text().strip().splitlines()):
-                parts = line.split()
-                if len(parts) != 5:
-                    continue
-                cls_idx = int(parts[0])
-                if cls_idx >= len(original_names):
-                    continue
-                orig_name = original_names[cls_idx]
-                new_name = INSPLAD_FAULT_MAP.get(orig_name)
-                if new_name is None or new_name not in DEFECT_CLASSES:
-                    continue
-
-                # YOLO format: cx cy w h (normalised)
-                cx, cy, bw, bh = (float(x) for x in parts[1:])
-                x1 = max(0, int((cx - bw / 2 - bw * padding) * w))
-                y1 = max(0, int((cy - bh / 2 - bh * padding) * h))
-                x2 = min(w, int((cx + bw / 2 + bw * padding) * w))
-                y2 = min(h, int((cy + bh / 2 + bh * padding) * h))
-                crop = img[y1:y2, x1:x2]
-                if crop.size == 0:
-                    continue
-
-                class_dir = split_out / new_name
-                class_dir.mkdir(exist_ok=True)
-                out_name = f"{img_path.stem}_{idx:03d}.jpg"
-                cv2.imwrite(str(class_dir / out_name), crop,
-                            [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-                crop_count += 1
-
-    print(f"  Extracted {crop_count} classifier crops -> {clf_root}")
-
-    # Print class distribution
-    for split_dir in sorted(clf_root.iterdir()):
-        if not split_dir.is_dir():
+        label = INSPLAD_FAULT_MAP.get((s.get("fault") or {}).get("label", ""))
+        if label is None or label not in DEFECT_CLASSES:
             continue
-        counts = {d.name: len(list(d.glob("*.jpg")))
-                  for d in split_dir.iterdir() if d.is_dir()}
-        total = sum(counts.values())
-        print(f"  {split_dir.name}: {total} crops across {len(counts)} classes")
+        split = sample_split(s)
+        dst = out / split / label / output_name(s["filepath"])
+        link_or_copy(raw, dst)
+        rows.append(provenance_row(
+            datasets_root=datasets_root, image_path=dst, src=src,
+            task="classifier", split=split, label=label,
+            origin=f"{s['filepath']} (asset={s.get('asset')})",
+        ))
+    return rows
 
-    return clf_root
+
+def _summarise(rows: list[dict[str, str]], task: str) -> None:
+    from collections import Counter
+    c = Counter((r["split"], r["label"] or "-") for r in rows if r["task"] == task)
+    if not c:
+        return
+    print(f"  {task}:")
+    for (split, label), n in sorted(c.items()):
+        print(f"    {split:5s} {label:28s} {n}")
 
 
 # ---------------------------------------------------------------------------
@@ -312,64 +245,67 @@ def download_fault_dataset(
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Download InsPLAD and reformat for grid-cv training.",
+        description="Download InsPLAD (Hugging Face) and convert for grid-cv.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Get a free Roboflow API key at:\n"
-            "  https://app.roboflow.com/ -> Settings -> Roboflow API\n\n"
-            "If the default workspace/project slugs fail (404 error), go to\n"
-            "universe.roboflow.com, find each dataset, click Download -> YOLOv8\n"
-            "-> Show download code, then pass the workspace/project/version here.\n\n"
-            "Example:\n"
-            "  python scripts/download_insplad.py \\\n"
-            "      --api-key abc123 --output datasets/ \\\n"
-            "      --det-workspace insplad --det-project insplad-det --det-version 1 \\\n"
-            "      --fault-workspace insplad --fault-project insplad-fault --fault-version 1"
-        ),
+        epilog=__doc__,
     )
-    p.add_argument("--api-key", required=True, help="Roboflow API key")
     p.add_argument("--output", type=Path, default=Path("datasets"),
-                   help="Root output directory (default: datasets/)")
-    p.add_argument("--skip-det",   action="store_true",
-                   help="Skip InsPLAD-det (detector dataset)")
-    p.add_argument("--skip-fault", action="store_true",
-                   help="Skip InsPLAD-fault (classifier dataset)")
-    # Explicit workspace/project/version overrides (for when slugs change)
-    p.add_argument("--det-workspace", default="insplad")
-    p.add_argument("--det-project",   default="insplad-det")
-    p.add_argument("--det-version",   type=int, default=1)
-    p.add_argument("--fault-workspace", default="insplad")
-    p.add_argument("--fault-project",   default="insplad-fault")
-    p.add_argument("--fault-version",   type=int, default=1)
+                   help="Datasets root (default: datasets/)")
+    p.add_argument("--skip-det", action="store_true", help="Skip detector data")
+    p.add_argument("--skip-fault", action="store_true", help="Skip classifier data")
+    p.add_argument("--limit", type=int, default=None,
+                   help="Only take N samples per split/label (smoke test)")
+    p.add_argument("--workers", type=int, default=8, help="Parallel downloads")
     return p.parse_args()
 
 
-if __name__ == "__main__":
-    _require("roboflow", "roboflow")
-    _require("yaml",     "pyyaml")
-    _require("cv2",      "opencv-python")
-
+def main() -> None:
     args = _parse_args()
-    args.output.mkdir(parents=True, exist_ok=True)
+    root: Path = args.output.resolve()
+    raw_dir = root / "_raw" / "insplad_hf"
+    raw_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"Fetching InsPLAD index from {HF_REPO}@{HF_REVISION[:8]} ...")
+    samples = load_samples(raw_dir)
+
+    wanted: dict[str, list[dict]] = {}
     if not args.skip_det:
-        download_detector_dataset(
-            args.api_key, args.output,
-            workspace=args.det_workspace,
-            project=args.det_project,
-            version=args.det_version,
-        )
-
+        wanted["detection"] = [s for s in samples if s["task"] == "detection"]
     if not args.skip_fault:
-        download_fault_dataset(
-            args.api_key, args.output,
-            workspace=args.fault_workspace,
-            project=args.fault_project,
-            version=args.fault_version,
-        )
+        wanted["fault_classification"] = [
+            s for s in samples if s["task"] == "fault_classification"
+        ]
+    if args.limit:
+        wanted = {k: _limit_per_group(v, args.limit) for k, v in wanted.items()}
 
-    print("\nAll done. Next steps:")
-    print("  python scripts/train.py detector "
-          "--data datasets/detector/dataset.yaml")
-    print("  python scripts/train.py classifier "
-          "--data datasets/classifier/")
+    files = sorted({s["filepath"] for v in wanted.values() for s in v})
+    print(f"Downloading {len(files)} images to {raw_dir} ...")
+    failed = download_images(files, raw_dir, args.workers)
+
+    rows: list[dict[str, str]] = []
+    if "detection" in wanted:
+        rows += convert_detector(wanted["detection"], raw_dir, root)
+    if "fault_classification" in wanted:
+        rows += convert_classifier(wanted["fault_classification"], raw_dir, root)
+
+    # Keep provenance for any task we skipped this run.
+    regenerated = {"detection": "detector", "fault_classification": "classifier"}
+    redone = {regenerated[k] for k in wanted}
+    existing = root / "insplad" / PROVENANCE_FILENAME
+    if existing.exists():
+        rows += [r for r in read_provenance(existing) if r["task"] not in redone]
+
+    prov = write_provenance(root / "insplad", rows)
+    print(f"\nWrote {len(rows)} provenance rows -> {prov}")
+    _summarise(rows, "detector")
+    _summarise(rows, "classifier")
+
+    if failed:
+        print(f"\n{len(failed)} downloads failed; re-run to retry them.")
+        sys.exit(1)
+
+    print("\nNext: python scripts/build_training_set.py --name poc")
+
+
+if __name__ == "__main__":
+    main()

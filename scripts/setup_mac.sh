@@ -80,7 +80,8 @@ echo "[4/6] Installing dependencies (this may take a few minutes)..."
   ultralytics \
   sahi \
   albumentations \
-  roboflow \
+  huggingface_hub \
+  gdown \
   pyyaml \
   pandas \
   tqdm \
@@ -116,12 +117,13 @@ echo ""
 echo "  Activate the environment:"
 echo "    source .venv/bin/activate"
 echo ""
-echo "  Download InsPLAD (needs free Roboflow API key):"
-echo "    python scripts/download_insplad.py \\"
-echo "        --api-key YOUR_KEY --output datasets/"
+echo "  Download data (free, no API keys, ~7 GB):"
+echo "    python scripts/download_insplad.py"
+echo "    python scripts/download_mpid.py"
+echo "    python scripts/build_training_set.py --name poc"
 echo ""
 echo "  Then train:"
-echo "    python scripts/train.py detector \\"
-echo "        --data datasets/detector/dataset.yaml"
+echo "    python scripts/train.py detector --data datasets/build/poc/detector.yaml"
+echo "    python scripts/train.py classifier --data datasets/build/poc/classifier"
 echo "================================================"
 echo ""

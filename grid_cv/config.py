@@ -47,7 +47,7 @@ COMPONENT_CLASSES: Final[list[str]] = [
 # ---------------------------------------------------------------------------
 # Defect / health classes (Stage 2 — classification)
 #
-# 31 failure modes across poles, crossarms, insulators, transformers,
+# 33 failure modes across poles, crossarms, insulators, transformers,
 # conductors, and hardware.  "healthy" is always index 0.
 #
 # Grouped by component for readability; order = class index in classifier.
@@ -98,6 +98,10 @@ DEFECT_CLASSES: Final[list[str]] = [
     "arrester_damage",         # 29 cracked housing or blown cap
     "hardware_missing",        # 30 absent cap, pin, bolt, or tie wire
     "vegetation_contact",      # 31 branch / vine touching energised parts
+
+    # ---- Added for InsPLAD labels (32-33); appended to keep indices stable ----
+    "hardware_corrosion",      # 32 rust on shackles, yokes, clamps, grips
+    "bird_nest",               # 33 nest material on structure or hardware
 ]
 
 # ---------------------------------------------------------------------------
@@ -153,6 +157,8 @@ SEVERITY_MAP: Final[dict[str, str]] = {
     "arrester_damage":           "CRITICAL",
     "hardware_missing":          "LOW",
     "vegetation_contact":        "CRITICAL",
+    "hardware_corrosion":        "LOW",
+    "bird_nest":                 "MEDIUM",
 }
 
 # Which defect classes require a thermal (radiometric) image to detect reliably
@@ -161,46 +167,52 @@ THERMAL_REQUIRED: Final[set[str]] = {
     "splice_overheating",
 }
 
-# InsPLAD-fault class names -> our defect class names
-# Used by scripts/download_insplad.py to remap labels
+# ---------------------------------------------------------------------------
+# Source-dataset label maps (used by scripts/download_*.py)
+#
+# Names match the actual labels in each source.  A source label missing from
+# a map is dropped during conversion.
+# ---------------------------------------------------------------------------
+
+# InsPLAD supervised fault labels (Voxel51 HF build, `fault` field).
+# The faulted assets are a polymer-insulator upper shackle, a glass
+# insulator, a yoke suspension, a lightning-rod suspension and a vari-grip.
+# "lightning rod" here is the shield-wire (para-raios) suspension: tower
+# hardware, not a surge arrester.
 INSPLAD_FAULT_MAP: Final[dict[str, str]] = {
-    "bird-nest":                        "insulator_bird_fouling",
-    "damaged-insulator":                "insulator_chipped_shed",
-    "deteriorated-paint":               "transformer_corrosion",
-    "electrical-insulator":             "healthy",          # detection, not fault
-    "exposed-metallic-cable":           "conductor_broken_strand",
-    "graffiti-on-insulator":            "insulator_contamination",
-    "insulator-cement-spalling":        "insulator_cement_spalling",
-    "misaligned-pulley":                "hardware_missing",
-    "oil-leakage-on-insulator":         "insulator_flashover",
-    "oil-leakage-on-transformer":       "transformer_oil_leak",
-    "oil-leakage-on-transformer-low":   "transformer_oil_leak",
-    "oil-leakage-on-transformer-medium":"transformer_oil_leak",
-    "oil-leakage-on-transformer-high":  "transformer_oil_leak",
-    "rusty-grounding-cable":            "conductor_corrosion",
-    "rusty-grounding-connection":       "conductor_corrosion",
-    "weather-barrier-damage":           "crossarm_burn",
+    "good":        "healthy",
+    "rust":        "hardware_corrosion",
+    "missing_cap": "insulator_broken_disc",   # missing glass disc in a string
+    "bird_nest":   "bird_nest",
 }
 
-# InsPLAD-det class names -> our component class names
+# InsPLAD-det labels (`ground_truth` field).  InsPLAD is transmission
+# imagery, so it only yields `insulator` and `hardware` boxes.
 INSPLAD_DET_MAP: Final[dict[str, str]] = {
-    "bird-nest":                "hardware",       # treat as hardware/other
-    "conductor":                "conductor",
-    "cross-arm":                "crossarm",
-    "electrical-insulator":     "insulator",
-    "electrical-load":          "transformer",
-    "float-valve":              "hardware",
-    "grounding-cable":          "conductor",
-    "insulator-string":         "insulator",
-    "lightning-rod":            "arrester",
-    "pulley":                   "hardware",
-    "spacer":                   "splice",
-    "tower-body":               "pole",
-    "tower-peak":               "pole",
-    "tower-window":             "hardware",
-    "transformer":              "transformer",
-    "transmission-line":        "conductor",
-    "vibration-damper":         "splice",
+    "glass insulator":                 "insulator",
+    "polymer insulator":               "insulator",
+    "glass insulator big shackle":     "hardware",
+    "glass insulator small shackle":   "hardware",
+    "glass insulator tower shackle":   "hardware",
+    "polymer insulator lower shackle": "hardware",
+    "polymer insulator upper shackle": "hardware",
+    "polymer insulator tower shackle": "hardware",
+    "lightning rod shackle":           "hardware",
+    "lightning rod suspension":        "hardware",
+    "stockbridge damper":              "hardware",
+    "spiral damper":                   "hardware",
+    "spacer":                          "hardware",   # bundle spacer, not a splice
+    "vari-grip":                       "hardware",
+    "yoke":                            "hardware",
+    "yoke suspension":                 "hardware",
+    # dropped: "tower id plate", "sphere" (aviation marker ball)
+}
+
+# MPID: each sub-folder has a single class, and all of them are insulators.
+MPID_DET_MAP: Final[dict[str, str]] = {
+    "iso_poly": "insulator",   # composite_MPID
+    "1":        "insulator",   # glass_MPID
+    "iso-su":   "insulator",   # porcelain_MPID
 }
 
 # ---------------------------------------------------------------------------
