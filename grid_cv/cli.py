@@ -159,10 +159,10 @@ def inspect_cmd(
         )
 
     console.print(table)
-    console.print(f"\n[green]✓[/green] GeoJSON → {geojson_path}")
-    console.print(f"[green]✓[/green] CSV     → {csv_path}")
+    console.print(f"\n[green]OK[/green] GeoJSON -> {geojson_path}")
+    console.print(f"[green]OK[/green] CSV     -> {csv_path}")
     if not no_annotate:
-        console.print(f"[green]✓[/green] Annotated images → {annotated_dir}/")
+        console.print(f"[green]OK[/green] Annotated images -> {annotated_dir}/")
 
 
 @app.command("serve")
