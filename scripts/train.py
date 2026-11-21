@@ -34,11 +34,18 @@ def _best_device() -> str:
     """
     try:
         import torch
-        if torch.backends.mps.is_available():
+        # Apple Silicon — check is_built() first to avoid attribute errors
+        # on non-Apple PyTorch builds
+        mps_ok = (
+            hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_built()
+            and torch.backends.mps.is_available()
+        )
+        if mps_ok:
             return "mps"
         if torch.cuda.is_available():
             return "0"
-    except ImportError:
+    except Exception:
         pass
     return "cpu"
 
@@ -197,7 +204,8 @@ def _parse_args() -> argparse.Namespace:
     det.add_argument("--epochs", type=int, default=100)
     det.add_argument("--imgsz",  type=int, default=640)
     det.add_argument("--batch",  type=int, default=16)
-    det.add_argument("--device", default="0")
+    det.add_argument("--device", default=None,
+                     help="Device: 'mps', 'cpu', '0' (CUDA). Auto-detected if omitted.")
     det.add_argument("--output", type=Path, default=Path("runs/detect"))
     det.add_argument("--resume", action="store_true")
     det.add_argument("--workers", type=int, default=8)
@@ -209,7 +217,8 @@ def _parse_args() -> argparse.Namespace:
     cls.add_argument("--epochs", type=int, default=50)
     cls.add_argument("--imgsz",  type=int, default=224)
     cls.add_argument("--batch",  type=int, default=32)
-    cls.add_argument("--device", default="0")
+    cls.add_argument("--device", default=None,
+                     help="Device: 'mps', 'cpu', '0' (CUDA). Auto-detected if omitted.")
     cls.add_argument("--output", type=Path, default=Path("runs/classify"))
     cls.add_argument("--resume", action="store_true")
 

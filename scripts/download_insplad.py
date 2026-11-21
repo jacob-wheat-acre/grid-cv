@@ -101,6 +101,24 @@ def _write_dataset_yaml(
 # Download helpers
 # ---------------------------------------------------------------------------
 
+_ROBOFLOW_HINT = """
+Roboflow workspace not found.  The InsPLAD dataset slug may have changed.
+To get the correct download snippet:
+
+  1. Go to https://universe.roboflow.com and search "InsPLAD"
+  2. Open the dataset -> click "Download Dataset" -> choose "YOLOv8" format
+  3. Select "Show download code" -> copy the Python snippet
+  4. The snippet will look like:
+       rf.workspace("WORKSPACE").project("PROJECT").version(N).download("yolov8")
+  5. Re-run with the correct values:
+       python scripts/download_insplad.py \\
+           --api-key YOUR_KEY \\
+           --det-workspace WORKSPACE --det-project PROJECT --det-version N \\
+           --fault-workspace WORKSPACE2 --fault-project PROJECT2 --fault-version N2 \\
+           --output datasets/
+"""
+
+
 def _download_roboflow(
     api_key: str,
     workspace: str,
@@ -110,27 +128,38 @@ def _download_roboflow(
     fmt: str = "yolov8",
 ) -> Path:
     from roboflow import Roboflow  # type: ignore
-    rf = Roboflow(api_key=api_key)
-    proj = rf.workspace(workspace).project(project)
-    dataset = proj.version(version).download(fmt, location=str(output_dir), overwrite=False)
-    return Path(dataset.location)
+    try:
+        rf = Roboflow(api_key=api_key)
+        proj = rf.workspace(workspace).project(project)
+        dataset = proj.version(version).download(fmt, location=str(output_dir), overwrite=False)
+        return Path(dataset.location)
+    except Exception as exc:
+        if "does not exist" in str(exc) or "404" in str(exc) or "permissions" in str(exc):
+            print(_ROBOFLOW_HINT)
+        raise
 
 
 # ---------------------------------------------------------------------------
 # Stage 1 – detector dataset
 # ---------------------------------------------------------------------------
 
-def download_detector_dataset(api_key: str, output_root: Path) -> Path:
+def download_detector_dataset(
+    api_key: str,
+    output_root: Path,
+    workspace: str = "insplad",
+    project: str = "insplad-det",
+    version: int = 1,
+) -> Path:
     """Download insplad-det and remap to grid-cv component classes."""
     from grid_cv.config import COMPONENT_CLASSES, INSPLAD_DET_MAP
 
     out = output_root / "insplad_det_raw"
-    print("Downloading InsPLAD-det (asset detection)...")
+    print(f"Downloading {workspace}/{project} v{version} (asset detection)...")
     dataset_path = _download_roboflow(
         api_key=api_key,
-        workspace="insplad",
-        project="insplad-det",
-        version=1,
+        workspace=workspace,
+        project=project,
+        version=version,
         output_dir=out,
     )
 
@@ -166,7 +195,13 @@ def download_detector_dataset(api_key: str, output_root: Path) -> Path:
 # Stage 2 – classifier dataset
 # ---------------------------------------------------------------------------
 
-def download_fault_dataset(api_key: str, output_root: Path) -> Path:
+def download_fault_dataset(
+    api_key: str,
+    output_root: Path,
+    workspace: str = "insplad",
+    project: str = "insplad-fault",
+    version: int = 1,
+) -> Path:
     """
     Download insplad-fault and convert to an ImageFolder layout for the
     YOLOv8 classifier (one subdirectory per class).
@@ -182,12 +217,12 @@ def download_fault_dataset(api_key: str, output_root: Path) -> Path:
     from grid_cv.config import DEFECT_CLASSES, INSPLAD_FAULT_MAP
 
     out = output_root / "insplad_fault_raw"
-    print("\nDownloading InsPLAD-fault (defect detection)...")
+    print(f"\nDownloading {workspace}/{project} v{version} (fault detection)...")
     dataset_path = _download_roboflow(
         api_key=api_key,
-        workspace="insplad",
-        project="insplad-fault",
-        version=1,
+        workspace=workspace,
+        project=project,
+        version=version,
         output_dir=out,
     )
 
@@ -282,9 +317,14 @@ def _parse_args() -> argparse.Namespace:
         epilog=(
             "Get a free Roboflow API key at:\n"
             "  https://app.roboflow.com/ -> Settings -> Roboflow API\n\n"
+            "If the default workspace/project slugs fail (404 error), go to\n"
+            "universe.roboflow.com, find each dataset, click Download -> YOLOv8\n"
+            "-> Show download code, then pass the workspace/project/version here.\n\n"
             "Example:\n"
             "  python scripts/download_insplad.py \\\n"
-            "      --api-key abc123 --output datasets/"
+            "      --api-key abc123 --output datasets/ \\\n"
+            "      --det-workspace insplad --det-project insplad-det --det-version 1 \\\n"
+            "      --fault-workspace insplad --fault-project insplad-fault --fault-version 1"
         ),
     )
     p.add_argument("--api-key", required=True, help="Roboflow API key")
@@ -294,6 +334,13 @@ def _parse_args() -> argparse.Namespace:
                    help="Skip InsPLAD-det (detector dataset)")
     p.add_argument("--skip-fault", action="store_true",
                    help="Skip InsPLAD-fault (classifier dataset)")
+    # Explicit workspace/project/version overrides (for when slugs change)
+    p.add_argument("--det-workspace", default="insplad")
+    p.add_argument("--det-project",   default="insplad-det")
+    p.add_argument("--det-version",   type=int, default=1)
+    p.add_argument("--fault-workspace", default="insplad")
+    p.add_argument("--fault-project",   default="insplad-fault")
+    p.add_argument("--fault-version",   type=int, default=1)
     return p.parse_args()
 
 
@@ -306,10 +353,20 @@ if __name__ == "__main__":
     args.output.mkdir(parents=True, exist_ok=True)
 
     if not args.skip_det:
-        download_detector_dataset(args.api_key, args.output)
+        download_detector_dataset(
+            args.api_key, args.output,
+            workspace=args.det_workspace,
+            project=args.det_project,
+            version=args.det_version,
+        )
 
     if not args.skip_fault:
-        download_fault_dataset(args.api_key, args.output)
+        download_fault_dataset(
+            args.api_key, args.output,
+            workspace=args.fault_workspace,
+            project=args.fault_project,
+            version=args.fault_version,
+        )
 
     print("\nAll done. Next steps:")
     print("  python scripts/train.py detector "
