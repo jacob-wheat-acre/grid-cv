@@ -78,3 +78,6 @@ pip-wheel-metadata/
 !.env.example
 secrets/
 credentials/
+
+# Ultralytics base weights auto-downloaded into the repo root
+*.pt
