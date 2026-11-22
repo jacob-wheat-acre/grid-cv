@@ -54,7 +54,10 @@ def _best_device() -> str:
 # Shared training configuration
 # ---------------------------------------------------------------------------
 
-DETECTOR_BASE_MODEL   = "yolov8m.pt"      # medium: good balance for aerial
+# Small model: on a 16 GB Apple Silicon Mac, yolov8m at batch 16 swaps to disk
+# (~4 h/epoch); yolov8s at batch 8 uses ~4.5 GB (~16 min/epoch).  Pass
+# --model yolov8m.pt on a machine with more memory.
+DETECTOR_BASE_MODEL   = "yolov8s.pt"
 CLASSIFIER_BASE_MODEL = "yolov8m-cls.pt"
 
 DETECTOR_HYPERPARAMS = {
@@ -78,19 +81,35 @@ DETECTOR_HYPERPARAMS = {
 }
 
 
+def _export_best(save_dir: Path, stage: str) -> None:
+    """Copy <save_dir>/weights/best.pt to models/<stage>.pt, or fail loudly."""
+    import shutil
+    from grid_cv.config import WEIGHTS_CLASSIFIER, WEIGHTS_DETECTOR
+
+    dest = WEIGHTS_DETECTOR if stage == "detector" else WEIGHTS_CLASSIFIER
+    best = save_dir / "weights" / "best.pt"
+    if not best.exists():
+        print(f"\nERROR: {best} not found; {dest} was NOT updated.", file=sys.stderr)
+        sys.exit(1)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(best, dest)
+    print(f"\nBest weights saved to {dest}")
+
+
 # ---------------------------------------------------------------------------
 # Detector training
 # ---------------------------------------------------------------------------
 
 def train_detector(
     data_yaml: Path,
-    epochs: int = 100,
+    epochs: int = 50,
     imgsz: int = 640,
-    batch: int = 16,
+    batch: int = 8,
     device: str | None = None,
     output_dir: Path = Path("runs/detect"),
     resume: bool = False,
-    workers: int = 8,
+    workers: int = 3,
+    base_model: str = DETECTOR_BASE_MODEL,
 ) -> None:
     try:
         from ultralytics import YOLO
@@ -100,21 +119,38 @@ def train_detector(
 
     resolved_device = device or _best_device()
     print(f"Device: {resolved_device}")
-    model = YOLO(DETECTOR_BASE_MODEL)
-    print(f"Training detector on {data_yaml}")
+    # Ultralytics 8.4 nests a *relative* project under runs/<task>/, so pass an
+    # absolute path.  Runs started before this fix live in the nested folder.
+    project = Path(output_dir).resolve()
+    run_name = "grid_cv_detector"
+    if resume:
+        candidates = [
+            project / run_name / "weights" / "last.pt",
+            Path("runs/detect") / Path(output_dir) / run_name / "weights" / "last.pt",
+        ]
+        last = next((c for c in candidates if c.exists()), None)
+        if last is None:
+            print(f"Nothing to resume: no last.pt in {candidates}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Resuming from {last}")
+        model = YOLO(str(last))
+    else:
+        model = YOLO(base_model)
+    print(f"Training detector ({base_model}) on {data_yaml}")
     model.train(
         data=str(data_yaml),
         epochs=epochs,
         imgsz=imgsz,
         batch=batch,
         device=resolved_device,
-        project=str(output_dir),
-        name="grid_cv_detector",
+        project=str(project),
+        name=run_name,
         exist_ok=True,
         resume=resume,
         workers=workers,
         **DETECTOR_HYPERPARAMS,
     )
+    save_dir = Path(model.trainer.save_dir)
 
     # Validate on val split
     metrics = model.val()
@@ -125,13 +161,7 @@ def train_detector(
     print(f"  Recall:   {metrics.box.r.mean():.4f}")
 
     # Export best weights to models/
-    best_weights = Path(output_dir) / "grid_cv_detector" / "weights" / "best.pt"
-    if best_weights.exists():
-        from grid_cv.config import WEIGHTS_DETECTOR
-        WEIGHTS_DETECTOR.parent.mkdir(parents=True, exist_ok=True)
-        import shutil
-        shutil.copy2(best_weights, WEIGHTS_DETECTOR)
-        print(f"\nBest weights saved to {WEIGHTS_DETECTOR}")
+    _export_best(save_dir, "detector")
 
 
 # ---------------------------------------------------------------------------
@@ -170,24 +200,19 @@ def train_classifier(
         imgsz=imgsz,
         batch=batch,
         device=resolved_device,
-        project=str(output_dir),
+        project=str(Path(output_dir).resolve()),
         name="grid_cv_classifier",
         exist_ok=True,
         resume=resume,
     )
+    save_dir = Path(model.trainer.save_dir)
 
     metrics = model.val()
     print("\n=== Classifier Validation Metrics ===")
     print(f"  Top-1 Accuracy: {metrics.top1:.4f}")
     print(f"  Top-5 Accuracy: {metrics.top5:.4f}")
 
-    best_weights = Path(output_dir) / "grid_cv_classifier" / "weights" / "best.pt"
-    if best_weights.exists():
-        from grid_cv.config import WEIGHTS_CLASSIFIER
-        WEIGHTS_CLASSIFIER.parent.mkdir(parents=True, exist_ok=True)
-        import shutil
-        shutil.copy2(best_weights, WEIGHTS_CLASSIFIER)
-        print(f"\nBest weights saved to {WEIGHTS_CLASSIFIER}")
+    _export_best(save_dir, "classifier")
 
 
 # ---------------------------------------------------------------------------
@@ -201,14 +226,16 @@ def _parse_args() -> argparse.Namespace:
     # --- detector ---
     det = sub.add_parser("detector", help="Train Stage-1 YOLOv8 detector")
     det.add_argument("--data", type=Path, required=True, help="Path to dataset.yaml")
-    det.add_argument("--epochs", type=int, default=100)
+    det.add_argument("--model", default=DETECTOR_BASE_MODEL,
+                     help=f"Base weights (default: {DETECTOR_BASE_MODEL})")
+    det.add_argument("--epochs", type=int, default=50)
     det.add_argument("--imgsz",  type=int, default=640)
-    det.add_argument("--batch",  type=int, default=16)
+    det.add_argument("--batch",  type=int, default=8)
     det.add_argument("--device", default=None,
                      help="Device: 'mps', 'cpu', '0' (CUDA). Auto-detected if omitted.")
     det.add_argument("--output", type=Path, default=Path("runs/detect"))
     det.add_argument("--resume", action="store_true")
-    det.add_argument("--workers", type=int, default=8)
+    det.add_argument("--workers", type=int, default=3)
 
     # --- classifier ---
     cls = sub.add_parser("classifier", help="Train Stage-2 defect classifier")
@@ -237,6 +264,7 @@ if __name__ == "__main__":
             output_dir=args.output,
             resume=args.resume,
             workers=args.workers,
+            base_model=args.model,
         )
     else:
         train_classifier(

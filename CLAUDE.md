@@ -40,7 +40,7 @@ python scripts/download_mpid.py         # Google Drive, insulator boxes only
 python scripts/build_training_set.py --name poc
 
 # Train Stage 1 detector
-python scripts/train.py detector --data datasets/build/poc/detector.yaml --epochs 100
+python scripts/train.py detector --data datasets/build/poc/detector.yaml   # yolov8s, 50 epochs, ~14 h on M4
 
 # Train Stage 2 classifier
 python scripts/train.py classifier --data datasets/build/poc/classifier --epochs 50
