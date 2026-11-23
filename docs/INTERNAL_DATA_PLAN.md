@@ -21,7 +21,7 @@ This document covers what has to happen on our side to close that gap.
 | # | Item | Owner | Notes |
 |---|------|-------|-------|
 | 1 | **Confirm we own or can use the photos for ML training** | Legal / Asset Mgmt | Photos shot by contractors: check the contract. Usage rights for "inspection" don't always cover "training a model." |
-| 2 | **Data handling classification** | IT Security | Geotagged images of grid assets may count as CEII or internal-sensitive. That decides where photos and labels can live. It's the main reason for self-hosted labeling tools (§3). |
+| 2 | **Data handling classification** | IT Security | Geotagged images of grid assets may count as CEII or internal-sensitive. That decides where photos and labels can live. It's the main reason for self-hosted labeling tools (§4). |
 | 3 | **Ultralytics AGPL-3.0 review** | Legal | YOLOv8 is AGPL. Internal use is generally fine. Any closed-source distribution or network-served product needs review or a commercial license. |
 | 4 | **Pick the first-release scope** | Engineering + Ops | Don't try all 34 defect classes at once. See §2. |
 | 5 | **Storage and compute location** | IT | Raw photos plus labels will be tens of GB. Training runs on a Mac mini M4 (~14 h for a detector) or any machine with a GPU. |
@@ -48,22 +48,116 @@ a handful of examples each will not learn. Recommendation:
   `splice_overheating`) for a later release unless we have radiometric
   thermal imagery.
 
-**Rough data targets** (these are rules of thumb, not guarantees):
-
-| What | Starting target |
-|------|-----------------|
-| Labeled photos for the detector | 1,000–2,000 photos |
-| Boxes per component class | 500+ (rare ones like `arrester` will lag) |
-| Examples per defect class | 150+ to start, 500+ to be reliable |
-| `healthy` examples | Plentiful; cap at about 3× the largest defect class |
-
-**Mining our archive for defects:** work orders, outage reports, and past
-inspection findings point at photos that actually show defects. That is much
-faster than scrolling through thousands of healthy-pole photos.
+For how much data each class needs, see §3.
 
 ---
 
-## 3. Labeling software
+## 3. How many photos do we need?
+
+No one can give an exact number ahead of time. It depends on how visually
+distinct each class is and how varied our photos are. Below are realistic
+ranges, followed by how to measure where we actually stand. All numbers are
+estimates.
+
+### Count examples per class, not photos
+
+The model learns from **labeled instances**, which means boxes for the
+detector and crops for the classifier. One distribution pole photo usually
+contains 5–15 components, so photos needed for the detector add up quickly.
+Defects don't: a photo of a healthy pole adds nothing to the
+`crossarm_rot` count. **The rarest class you care about sets the size of the
+project.**
+
+### Targets by maturity level
+
+Both stages start from pretrained weights (COCO / ImageNet), so they need far
+less data than a model trained from scratch.
+
+| Level | What it's good for | Detector (Stage 1) | Classifier (Stage 2) |
+|-------|-------------------|--------------------|----------------------|
+| **Pilot** | Proves our photos work end to end. Not for decisions. | ~200 photos, ~100+ boxes per component | ~50 per defect class |
+| **Useful** | Triage: flags likely problems for a human to confirm | ~1,000–2,000 photos, ~500–1,000 boxes per component | ~200–300 per defect class |
+| **Production** | Trusted for routine screening with spot-check review | ~3,000–5,000+ photos, 2,000+ boxes per component | ~500–1,000+ per defect class |
+
+For reference, Ultralytics' own guidance for *best* YOLO results is
+≥1,500 images and ≥10,000 instances per class. Treat that as a ceiling,
+not the bar for usefulness.
+
+Some classes will need more than these numbers:
+
+- **Visually subtle defects** such as `crossarm_rot`, `insulator_contamination`,
+  and early `transformer_oil_leak` need the high end of each range or more.
+  Obvious ones (`pole_fire_damage`, `bird_nest`, `vegetation_contact`) learn
+  faster.
+- **Small components** such as `splice`, `hardware`, and `guy_wire` are a few
+  pixels wide at normal flight distances and need more boxes than poles
+  or transformers.
+- **`healthy`** is easy to collect. Cap it at about 3× the largest defect class
+  so the classifier doesn't learn to answer "healthy" every time.
+
+### Variety matters as much as quantity
+
+500 examples from one feeder on one sunny afternoon are worth less than 200
+spread across conditions. Cover:
+
+- Seasons and lighting (overcast, low sun, backlit, snow)
+- Camera angles and distances, and every drone/camera model we fly
+- Equipment variety: wood, steel, and concrete poles; porcelain vs. polymer
+  insulators; different transformer vintages and manufacturers
+- Regions or service territories, if construction standards differ
+
+### Defects are rare, so search for them deliberately
+
+If oil leaks show up on 1 in 200 transformer photos, collecting 300 of them by
+scrolling means reviewing **60,000 transformer photos**. Find them through
+work orders, outage reports, and past inspection findings instead. Those
+point directly at photos that show defects.
+
+### The test set needs enough defects to be meaningful
+
+To trust a reported detection rate, the held-out test set needs enough real
+defects in it. If the model catches 80% of defects:
+
+| Defect examples in test set | Uncertainty (95%) on that 80% |
+|-----------------------------|-------------------------------|
+| 20 | ±18 points (could be 62–98%) |
+| 50 | ±11 points |
+| 100 | ±8 points |
+
+Aim for **at least 50, ideally 100, test examples per defect class** that
+we report on. These come on top of the training numbers above.
+
+### How to tell when we have enough
+
+Don't guess. Measure it with a **learning curve**:
+
+1. Train on 25%, 50%, and 100% of the labeled data, keeping the validation set fixed.
+2. Plot validation mAP (detector) or per-class recall (classifier) against
+   the amount of training data.
+3. **Still climbing** between 50% and 100%: more data will help, so keep
+   labeling. **Flattening out:** extra photos of that class won't help much.
+   Spend the time on new classes, harder examples, or label cleanup instead.
+
+Do this per class. Usually most classes plateau early and two or three keep
+needing more data.
+
+### Labeling effort estimate
+
+With about 10 boxes per photo and a condition set on each, expect roughly
+**1–3 minutes per photo** once labelers are practiced. Pre-labeling with a
+pilot model makes it faster.
+
+| Photos | Labeling hours (approx.) |
+|--------|--------------------------|
+| 200 (pilot) | 3–10 |
+| 1,500 (useful) | 25–75 |
+| 4,000 (production) | 65–200 |
+
+On top of that, budget about 10–20% for review and QA.
+
+---
+
+## 4. Labeling software
 
 Requirements: **free**, **self-hosted or desktop** (photos stay on our
 network), **exports YOLO format**, and **supports a condition attribute on
@@ -76,7 +170,7 @@ each box**.
   labelers can work on one project.
 - **Per-box attributes:** draw a box labeled `crossarm` and set
   `condition = crossarm_rot` on it. One pass produces both Stage 1 and
-  Stage 2 labels (see §4).
+  Stage 2 labels (see §5).
 - Built-in review/QA workflow (assign, label, review, accept), task
   splitting, and keyboard-driven labeling.
 - AI-assisted labeling: once our own model is decent, it can pre-label so
@@ -110,7 +204,7 @@ each box**.
 
 ---
 
-## 4. Labeling guidelines
+## 5. Labeling guidelines
 
 Use **one labeling pass** with boxes and attributes:
 
@@ -138,7 +232,7 @@ depends on full resolution.
 
 ---
 
-## 5. Train/validation/test split
+## 6. Train/validation/test split
 
 Split by **location or flight, not by photo**. Photos of the same pole from
 one flight are near-duplicates. If they land on both sides of the split, the
@@ -151,7 +245,7 @@ validation scores will look great and mean nothing.
 
 ---
 
-## 6. Plugging it into the code
+## 7. Plugging it into the code
 
 Once labels are exported:
 
@@ -181,12 +275,12 @@ Once labels are exported:
 
 ---
 
-## 7. Suggested sequence
+## 8. Suggested sequence
 
 1. Get the approvals in §1 (items 1–2 block everything else).
 2. Choose the Release 1 defect list (§2).
 3. Stand up CVAT internally and load a **pilot batch of ~200 photos**.
 4. Label the pilot, measure agreement between labelers, and fix the guide.
 5. Build the import script, then train a pilot model as an end-to-end check.
-6. Scale labeling to the §2 targets, using the pilot model to pre-label.
+6. Scale labeling to the §3 targets, using the pilot model to pre-label.
 7. Train Release 1 and evaluate it on the held-out feeders.
